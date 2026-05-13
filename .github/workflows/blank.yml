@@ -1,0 +1,226 @@
+name: Download and Split File
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'File URL to download'
+        required: true
+      filename:
+        description: 'Output filename (optional)'
+        required: false
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Remove old download folder from repo
+      run: |
+        rm -rf download
+        git rm -rf download 2>/dev/null || true
+        mkdir -p download
+        echo "✅ Removed old download folder from repo"
+
+    - name: Download file
+      run: |
+        cd download
+        curl -L -J -O --fail --progress-bar "${{ inputs.file_url }}"
+        
+        ORIGINAL_FILE=$(ls -1 | head -n 1)
+        if [ -n "${{ inputs.filename }}" ]; then
+          mv "$ORIGINAL_FILE" "${{ inputs.filename }}"
+          ORIGINAL_FILE="${{ inputs.filename }}"
+        fi
+        
+        echo "FILE_NAME=${ORIGINAL_FILE}" >> $GITHUB_ENV
+        FILE_SIZE=$(stat -c%s "$ORIGINAL_FILE")
+        echo "FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))" >> $GITHUB_ENV
+
+    - name: Split and remove original
+      run: |
+        cd download
+        split -b 95M -d -a 3 "${{ env.FILE_NAME }}" "${{ env.FILE_NAME }}.part."
+        sha256sum "${{ env.FILE_NAME }}" > "${{ env.FILE_NAME }}.sha256"
+        CHUNK_COUNT=$(ls -1 "${{ env.FILE_NAME }}.part."* 2>/dev/null | wc -l)
+        echo "CHUNK_COUNT=${CHUNK_COUNT}" >> $GITHUB_ENV
+        rm "${{ env.FILE_NAME }}"
+
+    - name: Create self-cleaning reassemblers
+      run: |
+        cd download
+        
+        # Bash script (Linux/macOS/WSL/Git Bash) - auto cleans chunks
+        cat > reassemble.sh << 'EOF'
+        #!/bin/bash
+        # Auto-reassembler that cleans up chunks after success
+        
+        echo "🔧 Reassembling: $FILE_NAME"
+        
+        # Combine chunks
+        cat "$FILE_NAME".part.* > "$FILE_NAME"
+        
+        # Verify checksum
+        if command -v sha256sum >/dev/null 2>&1; then
+            if sha256sum -c "$FILE_NAME".sha256 2>/dev/null; then
+                echo "✅ Success! File: $FILE_NAME"
+                echo "Size: $(du -h "$FILE_NAME" | cut -f1)"
+                echo ""
+                echo "🧹 Cleaning up chunks..."
+                rm "$FILE_NAME".part.*
+                echo "✅ Chunks deleted. Only the final file remains."
+            else
+                rm "$FILE_NAME"
+                echo "❌ Checksum verification failed!"
+                exit 1
+            fi
+        elif command -v shasum >/dev/null 2>&1; then
+            # macOS
+            expected=$(cut -d' ' -f1 < "$FILE_NAME.sha256")
+            actual=$(shasum -a 256 "$FILE_NAME" | cut -d' ' -f1)
+            if [ "$actual" = "$expected" ]; then
+                echo "✅ Success! File: $FILE_NAME"
+                echo "Size: $(du -h "$FILE_NAME" | cut -f1)"
+                echo ""
+                echo "🧹 Cleaning up chunks..."
+                rm "$FILE_NAME".part.*
+                echo "✅ Chunks deleted. Only the final file remains."
+            else
+                rm "$FILE_NAME"
+                echo "❌ Checksum verification failed!"
+                exit 1
+            fi
+        else
+            echo "⚠️  No checksum tool found, skipping verification"
+            echo "✅ File reassembled: $FILE_NAME"
+            echo ""
+            echo "🧹 Cleaning up chunks..."
+            rm "$FILE_NAME".part.*
+            echo "✅ Chunks deleted. Only the final file remains."
+        fi
+        EOF
+        
+        # Windows Batch file - auto cleans chunks
+        cat > reassemble.bat << 'EOF'
+        @echo off
+        setlocal enabledelayedexpansion
+        
+        echo 🔧 Reassembling: %FILE_NAME%
+        
+        :: Combine chunks
+        copy /b "%FILE_NAME%.part.*" "%FILE_NAME%" > nul 2>&1
+        
+        if not exist "%FILE_NAME%" (
+            echo ❌ Failed to reassemble file
+            exit /b 1
+        )
+        
+        :: Verify checksum
+        echo Verifying integrity...
+        
+        :: Extract hash from certutil output (line 2, remove spaces)
+        for /f "skip=1 tokens=* delims=" %%h in ('certutil -hashfile "%FILE_NAME%" SHA256') do (
+            set "actual=%%h"
+            goto :got_actual
+        )
+        :got_actual
+        set "actual=%actual: =%"
+        
+        :: Read expected hash from file
+        set /p expected=<"%FILE_NAME%.sha256"
+        for /f "tokens=1" %%a in ("%expected%") do set "expected=%%a"
+        set "expected=%expected: =%"
+        
+        :: Compare (case-insensitive)
+        if /i "%actual%"=="%expected%" (
+            echo ✅ Success! File: %FILE_NAME%
+            for %%A in ("%FILE_NAME%") do echo Size: %%~zA bytes
+            echo.
+            echo 🧹 Cleaning up chunks...
+            del "%FILE_NAME%.part.*" 2>nul
+            del "%FILE_NAME%.sha256" 2>nul
+            echo ✅ Chunks deleted. Only the final file remains.
+        ) else (
+            echo ❌ Checksum verification failed!
+            echo Expected: %expected%
+            echo Actual:   %actual%
+            del "%FILE_NAME%" 2>nul
+            exit /b 1
+        )
+        
+        endlocal
+
+        EOF
+        
+        # Make bash script executable
+        chmod +x reassemble.sh
+        
+        # Replace placeholders
+        sed -i "s/\$FILE_NAME/${{ env.FILE_NAME }}/g" reassemble.sh
+        sed -i "s/%FILE_NAME%/${{ env.FILE_NAME }}/g" reassemble.bat
+
+    - name: Create simple README
+      run: |
+        cd download
+        
+        cat > README.txt << EOF
+        ========================================
+        FILE: ${{ env.FILE_NAME }}
+        SIZE: ${{ env.FILE_SIZE_MB }} MB
+        CHUNKS: ${{ env.CHUNK_COUNT }} files
+        ========================================
+        
+        HOW TO GET YOUR FILE:
+        
+        🐧 Linux / macOS / WSL / Git Bash:
+            bash reassemble.sh
+        
+        🪟 Windows (Command Prompt):
+            reassemble.bat
+        
+        WHAT IT DOES:
+        1. Reassembles the file from chunks
+        2. Verifies integrity with SHA256
+        3. Automatically deletes chunks
+        4. Leaves only the final file
+        
+        ========================================
+        EOF
+
+    - name: List created files
+      run: |
+        cd download
+        echo ""
+        echo "📦 Files in download folder:"
+        ls -lh | awk '{print "  " $9 " (" $5 ")"}'
+
+    - name: Commit and push
+      run: |
+        git config user.name "GitHub Action"
+        git config user.email "action@github.com"
+        git add download/
+        git commit -m "Download"
+        git push origin main
+
+    - name: Show instructions
+      run: |
+        echo "=========================================="
+        echo "✅ FILE READY FOR DOWNLOAD"
+        echo "=========================================="
+        echo ""
+        echo "📥 Download ZIP:"
+        echo "https://github.com/${{ github.repository }}/archive/refs/heads/main.zip"
+        echo ""
+        echo "After extracting, cd into download folder"
+        echo ""
+        echo "Then run:"
+        echo "  🐧 Linux/Mac: bash reassemble.sh"
+        echo "  🪟 Windows: reassemble.bat"
+        echo ""
+        echo "The script will automatically clean up chunks after success!"
+        echo "=========================================="
