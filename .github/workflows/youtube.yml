@@ -1,4 +1,4 @@
-name: Download and Split File
+name: Download and Split File youtube
 
 on:
   workflow_dispatch:
